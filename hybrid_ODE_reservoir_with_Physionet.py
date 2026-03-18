@@ -1,42 +1,33 @@
 import torch
+import torch.nn as nn
 from torchdiffeq import odeint
 import numpy as np
 import matplotlib.pyplot as plt
+from scipy.signal import butter, filtfilt, find_peaks, resample
+from scipy.stats import pearsonr
 import os
 import urllib.request
-import zipfile
-from scipy.signal import butter, filtfilt, find_peaks, resample
-from pathlib import Path
 
 
-# =============================================
-# БЛОК 1: Загрузка и чтение ЭКГ с PhysioNet
-# =============================================
+# =============================================================
+# БЛОК 1: Загрузчик реальных ЭКГ с PhysioNet
+# =============================================================
 
 class PhysioNetECGLoader:
     """
-    Загрузчик реальных ЭКГ-записей из базы ECG-ID Database
-    https://physionet.org/content/ecgiddb/1.0.0/
-
-    База содержит записи от 90 человек в формате EDF.
+    Загрузка записей ЭКГ из базы PhysioNet ECG-ID Database.
+    90 пациентов, 310 записей, 500 Гц, формат EDF.
     """
 
     def __init__(self, data_dir="ecgiddb_data"):
         self.data_dir = data_dir
         self.base_url = "https://physionet.org/files/ecgiddb/1.0.0/"
 
-    def download_sample_record(self, person_id=1, record_id=1):
-        """
-        Скачивает конкретную запись ЭКГ.
-        Файлы лежат по пути: Person_XX/rec_Y.edf
-        """
+    def download_record(self, person_id=1, record_id=1):
         os.makedirs(self.data_dir, exist_ok=True)
-
-        # Формируем путь к файлу на сервере
         person_folder = f"Person_{person_id:02d}"
         filename = f"rec_{record_id}.edf"
         remote_path = f"{self.base_url}{person_folder}/{filename}"
-
         local_folder = os.path.join(self.data_dir, person_folder)
         os.makedirs(local_folder, exist_ok=True)
         local_path = os.path.join(local_folder, filename)
@@ -48,687 +39,871 @@ class PhysioNetECGLoader:
                 print(f"Сохранено: {local_path}")
             except Exception as e:
                 print(f"Ошибка загрузки: {e}")
-                print("Попробуем альтернативный метод...")
-                self._download_with_wfdb(person_id, record_id)
-                return local_path
+                return None
         else:
             print(f"Файл уже существует: {local_path}")
-
         return local_path
 
-    def _download_with_wfdb(self, person_id, record_id):
-        """Альтернативная загрузка через библиотеку wfdb"""
-        try:
-            import wfdb
-            record_name = f"Person_{person_id:02d}/rec_{record_id}"
-            wfdb.dl_database(
-                'ecgiddb',
-                self.data_dir,
-                records=[record_name]
-            )
-        except ImportError:
-            print("Установите wfdb: pip install wfdb")
-
-    def read_edf_file(self, filepath):
-        """
-        Читает EDF-файл и возвращает сигнал + частоту дискретизации.
-
-        Это именно то, что показано в GitHub-ноутбуке:
-        https://github.com/TAUforPython/BioMedAI/blob/main/ECG%20EDF%202%20HEADAT.ipynb
-        """
+    def read_edf(self, filepath):
         try:
             import pyedflib
-
             f = pyedflib.EdfReader(filepath)
-            n_channels = f.signals_in_file
-
-            print(f"\n--- Информация об EDF-файле ---")
-            print(f"Количество каналов: {n_channels}")
-            print(f"Длительность записи: {f.file_duration} сек")
-
-            channel_labels = f.getSignalLabels()
-            sample_rates = []
-            signals = []
-
-            for i in range(n_channels):
-                label = channel_labels[i]
-                fs = f.getSampleFrequency(i)
-                signal = f.readSignal(i)
-                sample_rates.append(fs)
-                signals.append(signal)
-                print(f"  Канал {i}: '{label}', "
-                      f"частота = {fs} Гц, "
-                      f"отсчётов = {len(signal)}")
-
+            signal = f.readSignal(0)
+            fs = f.getSampleFrequency(0)
             f.close()
-
-            # Берём первый канал (обычно это отведение I ЭКГ)
-            ecg_signal = signals[0]
-            fs = sample_rates[0]
-
-            return ecg_signal, fs, channel_labels
-
+            return signal, fs
         except ImportError:
-            print("pyedflib не установлен, пробую mne...")
-            return self._read_with_mne(filepath)
-
-    def _read_with_mne(self, filepath):
-        """Альтернативное чтение через MNE"""
-        import mne
-        raw = mne.io.read_raw_edf(filepath, preload=True, verbose=False)
-        data = raw.get_data()
-        fs = raw.info['sfreq']
-        ch_names = raw.ch_names
-        print(f"Каналы: {ch_names}, Частота: {fs} Гц")
-        return data[0], fs, ch_names
+            import mne
+            raw = mne.io.read_raw_edf(filepath, preload=True, verbose=False)
+            return raw.get_data()[0], raw.info['sfreq']
 
 
-# =============================================
-# БЛОК 2: Предобработка ЭКГ-сигнала
-# =============================================
+# =============================================================
+# БЛОК 2: Предобработка ЭКГ с детекцией всех зубцов
+# =============================================================
 
 class ECGPreprocessor:
     """
-    Предобработка реального ЭКГ:
-    - Фильтрация (полосовой фильтр 0.5-40 Гц)
-    - Нормализация
-    - Выделение R-пиков
-    - Сегментация по кардиоциклам
+    Предобработка ЭКГ:
+    - Полосовой фильтр 0.5-40 Гц
+    - Детекция R-пиков, P-зубцов, T-зубцов
+    - Сегментация кардиоциклов
+    - Вычисление временных меток фаз сердечного цикла
     """
 
     @staticmethod
     def bandpass_filter(signal, fs, lowcut=0.5, highcut=40.0, order=4):
-        """Полосовой фильтр Баттерворта для удаления шумов"""
         nyq = 0.5 * fs
         low = lowcut / nyq
-        high = highcut / nyq
-        # Защита от некорректных значений
-        high = min(high, 0.99)
+        high = min(highcut / nyq, 0.99)
         b, a = butter(order, [low, high], btype='band')
-        filtered = filtfilt(b, a, signal)
-        return filtered
+        return filtfilt(b, a, signal)
 
     @staticmethod
     def normalize(signal):
-        """Нормализация в диапазон [0, 1]"""
-        sig_min = np.min(signal)
-        sig_max = np.max(signal)
-        if sig_max - sig_min < 1e-10:
+        s_min, s_max = np.min(signal), np.max(signal)
+        if s_max - s_min < 1e-10:
             return np.zeros_like(signal)
-        return (signal - sig_min) / (sig_max - sig_min)
+        return (signal - s_min) / (s_max - s_min)
 
     @staticmethod
     def find_r_peaks(signal, fs, min_distance_sec=0.4):
-        """
-        Поиск R-пиков (основных пиков ЭКГ).
-        Используется для сегментации по кардиоциклам.
-        """
         min_distance = int(min_distance_sec * fs)
-        # Адаптивный порог — 60% от максимума
         threshold = 0.6 * np.max(signal)
-        peaks, properties = find_peaks(
-            signal,
-            height=threshold,
-            distance=min_distance
-        )
+        peaks, _ = find_peaks(signal, height=threshold, distance=min_distance)
         return peaks
 
     @staticmethod
-    def extract_cardiac_cycles(signal, r_peaks, fs,
-                               pre_r_sec=0.2, post_r_sec=0.55):
+    def find_p_waves(signal, fs, r_peaks):
         """
-        Вырезает отдельные кардиоциклы вокруг R-пиков.
-        По умолчанию: 200 мс до R и 550 мс после R ≈ 0.75 сек.
+        P-зубец: ищем локальный максимум за 120-200 мс до R-пика.
+        Это момент деполяризации предсердий.
         """
-        pre_samples = int(pre_r_sec * fs)
-        post_samples = int(post_r_sec * fs)
-        cycle_length = pre_samples + post_samples
+        p_peaks = []
+        for r in r_peaks:
+            start = max(0, r - int(0.20 * fs))
+            end = max(0, r - int(0.08 * fs))
+            if start < end and end < len(signal):
+                segment = signal[start:end]
+                if len(segment) > 0:
+                    local_max = np.argmax(segment) + start
+                    p_peaks.append(local_max)
+        return np.array(p_peaks)
 
+    @staticmethod
+    def find_t_waves(signal, fs, r_peaks):
+        """
+        T-зубец: ищем локальный максимум через 150-400 мс после R-пика.
+        Это момент реполяризации желудочков (конец систолы).
+        """
+        t_peaks = []
+        for r in r_peaks:
+            start = r + int(0.15 * fs)
+            end = r + int(0.40 * fs)
+            if start < len(signal) and end < len(signal):
+                segment = signal[start:end]
+                if len(segment) > 0:
+                    local_max = np.argmax(segment) + start
+                    t_peaks.append(local_max)
+        return np.array(t_peaks)
+
+    @staticmethod
+    def compute_cardiac_phases(r_peaks, p_peaks, t_peaks, fs):
+        """
+        Вычисление временных меток фаз сердечного цикла:
+        - P-wave onset: начало предсердной систолы
+        - QRS onset: начало желудочковой систолы
+        - Aortic valve opening: ~50 мс после QRS
+        - T-wave peak: конец систолы
+        - RR interval: полный период
+        """
+        phases = []
+        for i in range(min(len(r_peaks), len(p_peaks), len(t_peaks))):
+            rr = (r_peaks[i + 1] - r_peaks[i]) / fs if i + 1 < len(r_peaks) else 0.85
+            phase = {
+                'p_wave_time': p_peaks[i] / fs,
+                'qrs_time': r_peaks[i] / fs,
+                'aortic_valve_open': (r_peaks[i] + int(0.05 * fs)) / fs,
+                't_wave_time': t_peaks[i] / fs,
+                'rr_interval': rr,
+                'heart_rate': 60.0 / rr if rr > 0 else 0
+            }
+            phases.append(phase)
+        return phases
+
+    def full_pipeline(self, signal, fs, target_length=500):
+        filtered = self.bandpass_filter(signal, fs)
+        normalized = self.normalize(filtered)
+        r_peaks = self.find_r_peaks(normalized, fs)
+
+        if len(r_peaks) < 3:
+            print("Слишком мало R-пиков!")
+            return None
+
+        p_peaks = self.find_p_waves(normalized, fs, r_peaks)
+        t_peaks = self.find_t_waves(normalized, fs, r_peaks)
+
+        rr_intervals = np.diff(r_peaks) / fs
+        heart_rate = 60.0 / np.mean(rr_intervals)
+        cardiac_phases = self.compute_cardiac_phases(r_peaks, p_peaks, t_peaks, fs)
+
+        # Сегментация кардиоциклов
+        pre_samples = int(0.2 * fs)
+        post_samples = int(0.55 * fs)
         cycles = []
         for peak in r_peaks:
             start = peak - pre_samples
             end = peak + post_samples
-            if start >= 0 and end <= len(signal):
-                cycle = signal[start:end]
-                cycles.append(cycle)
+            if start >= 0 and end <= len(normalized):
+                cycles.append(normalized[start:end])
 
-        return cycles, cycle_length
-
-    @staticmethod
-    def compute_average_cycle(cycles, target_length=200):
-        """
-        Усредняет все кардиоциклы для получения
-        «эталонного» (референсного) цикла.
-        Ресемплирует все циклы к единой длине.
-        """
-        resampled = []
-        for cycle in cycles:
-            resampled.append(resample(cycle, target_length))
-
+        # Усреднение
+        resampled = [resample(c, target_length) for c in cycles]
         resampled = np.array(resampled)
         mean_cycle = np.mean(resampled, axis=0)
         std_cycle = np.std(resampled, axis=0)
 
-        return mean_cycle, std_cycle, resampled
-
-    def full_pipeline(self, signal, fs, target_length=200):
-        """
-        Полный конвейер обработки:
-        сырой сигнал → фильтрация → нормализация →
-        R-пики → кардиоциклы → усреднение
-        """
-        # 1. Фильтрация
-        filtered = self.bandpass_filter(signal, fs)
-
-        # 2. Нормализация
-        normalized = self.normalize(filtered)
-
-        # 3. R-пики
-        r_peaks = self.find_r_peaks(normalized, fs)
-        print(f"Найдено R-пиков: {len(r_peaks)}")
-
-        if len(r_peaks) < 2:
-            print("Слишком мало R-пиков! Проверьте сигнал.")
-            return None
-
-        # 4. ЧСС (для информации)
-        rr_intervals = np.diff(r_peaks) / fs
-        heart_rate = 60.0 / np.mean(rr_intervals)
-        print(f"Средняя ЧСС: {heart_rate:.1f} уд/мин")
-        print(f"Средний RR-интервал: {np.mean(rr_intervals) * 1000:.0f} мс")
-
-        # 5. Кардиоциклы
-        cycles, cycle_len = self.extract_cardiac_cycles(
-            normalized, r_peaks, fs
-        )
-        print(f"Извлечено кардиоциклов: {len(cycles)}")
-
-        # 6. Усреднение
-        mean_cycle, std_cycle, all_resampled = \
-            self.compute_average_cycle(cycles, target_length)
+        print(f"R-пиков: {len(r_peaks)}, P-зубцов: {len(p_peaks)}, "
+              f"T-зубцов: {len(t_peaks)}")
+        print(f"ЧСС: {heart_rate:.1f} уд/мин, "
+              f"RR: {np.mean(rr_intervals)*1000:.0f} мс")
 
         return {
             'filtered': filtered,
             'normalized': normalized,
             'r_peaks': r_peaks,
+            'p_peaks': p_peaks,
+            't_peaks': t_peaks,
             'heart_rate': heart_rate,
+            'rr_interval': np.mean(rr_intervals),
+            'cardiac_phases': cardiac_phases,
             'cycles': cycles,
             'mean_cycle': mean_cycle,
             'std_cycle': std_cycle,
-            'all_cycles_resampled': all_resampled,
+            'all_cycles_resampled': resampled,
             'fs': fs
         }
 
 
-# =============================================
-# БЛОК 3: Нейросеть (Reservoir Computing)
-# =============================================
+# =============================================================
+# БЛОК 3: Функция активации сердечного цикла (эластанс)
+# =============================================================
 
-class ReservoirNet(torch.nn.Module):
+class CardiacActivation:
     """
-    Нейросеть на основе Reservoir Computing / NG-RC
-    - Input: 5 state volumes
-    - Reservoir: случайная проекция + нелинейность
-    - Readout: обучаемый линейный слой → 2 выхода (Pperi, Vspt)
+    Модель варьирующейся во времени эластичности E(t).
+    Связь с ЭКГ:
+      - P-зубец: начало роста E_atria
+      - QRS: начало роста E_ventricles
+      - T-зубец: начало падения E_ventricles
     """
 
-    def __init__(self, input_dim=5, reservoir_size=50, output_dim=2):
+    def __init__(self, T=0.85, T_sys=0.3, T_atrial=0.1,
+                 atrial_delay=0.12):
+        """
+        T: период сердечного цикла (из RR интервала ЭКГ)
+        T_sys: длительность систолы желудочков (QRS → T-зубец)
+        T_atrial: длительность систолы предсердий (P-зубец)
+        atrial_delay: задержка предсердной систолы перед QRS
+        """
+        self.T = T
+        self.T_sys = T_sys
+        self.T_atrial = T_atrial
+        self.atrial_delay = atrial_delay
+
+    def e_ventricle(self, t):
+        """
+        Активация желудочков.
+        Соответствует ЭКГ: от QRS до конца T-зубца.
+        """
+        t_mod = t % self.T
+        if t_mod < self.T_sys:
+            # Систола: рост и пик
+            return 0.5 * (1.0 - np.cos(np.pi * t_mod / self.T_sys))
+        elif t_mod < 1.5 * self.T_sys:
+            # Расслабление: падение
+            return 0.5 * (1.0 + np.cos(
+                2.0 * np.pi * (t_mod - self.T_sys) / self.T_sys))
+        else:
+            # Диастола: минимум
+            return 0.0
+
+    def e_atrium(self, t):
+        """
+        Активация предсердий.
+        Соответствует ЭКГ: P-зубец (перед QRS).
+        Обеспечивает 'предсердную подкачку' (atrial kick).
+        """
+        t_mod = t % self.T
+        # Предсердная систола начинается за atrial_delay до конца цикла
+        t_atrial_start = self.T - self.atrial_delay - self.T_atrial
+        t_atrial_end = self.T - self.atrial_delay
+
+        if t_atrial_start < t_mod < t_atrial_end:
+            phase = (t_mod - t_atrial_start) / self.T_atrial
+            return 0.5 * (1.0 - np.cos(2.0 * np.pi * phase))
+        return 0.0
+
+
+# =============================================================
+# БЛОК 4: Reservoir Computing
+# =============================================================
+
+class ReservoirNet(nn.Module):
+    """
+    Reservoir Computing для аппроксимации Pperi и Vspt.
+
+    Входы синхронизированы с фазами ЭКГ:
+    - 5 объёмов камер (V_LA, V_LV, V_Aorta, V_RA, V_RV)
+    Выходы:
+    - Pperi: перикардиальное давление
+    - Vspt: объём межжелудочковой перегородки
+
+    Валидация Pperi:
+    - Пик должен совпадать с концом диастолы (перед P-зубцом)
+    - НЕ должен быть во время систолы
+    """
+
+    def __init__(self, input_dim=5, reservoir_size=100,
+                 output_dim=2, spectral_radius=0.95,
+                 input_scale=0.1, sparsity=0.9):
         super().__init__()
-        self.W_in = torch.nn.Parameter(
-            torch.randn(input_dim, reservoir_size) * 0.1,
-            requires_grad=False
-        )
-        self.W_res = torch.nn.Parameter(
-            torch.randn(reservoir_size, reservoir_size) * 0.05,
-            requires_grad=False
-        )
-        self.readout = torch.nn.Sequential(
-            torch.nn.Linear(reservoir_size, 20),
-            torch.nn.ReLU(),
-            torch.nn.Linear(20, output_dim)
+
+        # Входная матрица (фиксированная)
+        W_in = torch.randn(input_dim, reservoir_size) * input_scale
+        self.register_buffer('W_in', W_in)
+
+        # Матрица резервуара (фиксированная, разреженная)
+        W_res = torch.randn(reservoir_size, reservoir_size)
+        mask = (torch.rand(reservoir_size, reservoir_size) > sparsity).float()
+        W_res = W_res * mask
+
+        # Нормализация по спектральному радиусу
+        eigenvalues = torch.linalg.eigvals(W_res).abs()
+        max_eig = eigenvalues.max().item()
+        if max_eig > 0:
+            W_res = W_res * (spectral_radius / max_eig)
+        self.register_buffer('W_res', W_res)
+
+        # Обучаемый выходной слой
+        self.readout = nn.Sequential(
+            nn.Linear(reservoir_size, 32),
+            nn.Tanh(),
+            nn.Linear(32, output_dim)
         )
 
     def forward(self, x):
-        r = torch.tanh(x @ self.W_in + (x @ self.W_in) @ self.W_res)
+        """
+        x: [batch, 5] — объёмы 5 камер сердца
+        Возвращает: [batch, 2] — [Pperi, Vspt]
+        """
+        h = x @ self.W_in
+        r = torch.tanh(h + h @ self.W_res)
         return self.readout(r)
 
 
-# =============================================
-# БЛОК 4: Гибридная ODE-модель
-# =============================================
+# =============================================================
+# БЛОК 5: Гибридная ODE — 5 камер сердца
+# =============================================================
 
-class HybridODEFunc(torch.nn.Module):
-    def __init__(self, p_tensor, net):
+class HybridCardiacODE(nn.Module):
+    """
+    Система 5 ОДУ для объёмов камер сердца:
+      dV_LA/dt  = Q_pulm_vein - Q_mitral
+      dV_LV/dt  = Q_mitral    - Q_aortic
+      dV_Ao/dt  = Q_aortic    - Q_systemic
+      dV_RA/dt  = Q_vena_cava - Q_tricuspid
+      dV_RV/dt  = Q_tricuspid - Q_pulmonary
+
+    Давления через закон Франка-Старлинга:
+      Желудочки: P = E(t) * (V - V0)
+      Предсердия/аорта: P = (V - V0) / C
+
+    Клапаны = диоды: Q > 0 только если ΔP > 0
+
+    Reservoir Computing аппроксимирует Pperi и Vspt,
+    синхронизированные с фазами ЭКГ.
+    """
+
+    def __init__(self, params, net, cardiac_activation):
         super().__init__()
-        self.p = p_tensor
+        self.p = params
         self.net = net
+        self.activation = cardiac_activation
 
-    def forward(self, t, u):
-        Qmt, Qav, Qtc, Qpv, Vlv, Vao, Vvc, Vrv, Vpa, Vpu = u
+    def forward(self, t, V):
+        """
+        V = [V_LA, V_LV, V_Aorta, V_RA, V_RV]
+        Возвращает: dV/dt
+        """
+        V_LA, V_LV, V_Ao, V_RA, V_RV = V[0], V[1], V[2], V[3], V[4]
         p = self.p
 
-        (Elvf, Eao, Evc, Ervf, Epa, Epu,
-         Rmt, Rav, Rsys, Rtc, Rpv, Rpul,
-         Lmt, Lav, Ltc, Lpv,
-         Vdlvf, Vdao, Vdvc, Vdrvf, Vdpa, Vdpu,
-         P0lvf, P0rvf, lambdalvf, lambdarvf,
-         Espt, V0lvf, V0rvf, P0spt, P0pcd,
-         V0spt, V0pcd, lambdaspt, lambdapcd,
-         Vdspt, Pth) = p
+        t_val = t.item() if isinstance(t, torch.Tensor) else t
 
-        # Функция активации сердца (один кардиоцикл ≈ 0.75 с)
-        e = torch.exp(-80 * ((t % 0.75) - 0.375) ** 2)
+        # ===== Активация (связь с ЭКГ) =====
+        e_v = self.activation.e_ventricle(t_val)
+        e_a = self.activation.e_atrium(t_val)
+        e_v_t = torch.tensor(e_v, dtype=torch.float32)
+        e_a_t = torch.tensor(e_a, dtype=torch.float32)
 
-        inp = torch.stack([Vlv, Vao, Vvc, Vrv, Vpa]).unsqueeze(0)
-        z = self.net(inp).squeeze(0)
-        Pperi, Vspt = z[0], z[1]
+        # ===== Эластансы =====
+        # Желудочки: варьирующаяся эластичность E(t)
+        E_LV = p['E_lv_min'] + (p['E_lv_max'] - p['E_lv_min']) * e_v_t
+        E_RV = p['E_rv_min'] + (p['E_rv_max'] - p['E_rv_min']) * e_v_t
 
-        Vlvf = Vlv - Vspt
-        Vrvf = Vrv + Vspt
+        # Предсердия: базовая + активная компонента
+        E_LA = p['E_la_min'] + (p['E_la_max'] - p['E_la_min']) * e_a_t
+        E_RA = p['E_ra_min'] + (p['E_ra_max'] - p['E_ra_min']) * e_a_t
 
-        exp_lv = torch.exp(torch.clamp(lambdalvf * (Vlvf - V0lvf), max=88.0))
-        exp_rv = torch.exp(torch.clamp(lambdarvf * (Vrvf - V0rvf), max=88.0))
+        # ===== Нейросеть: Pperi и Vspt =====
+        inp = torch.stack([V_LA, V_LV, V_Ao, V_RA, V_RV]).unsqueeze(0)
+        nn_out = self.net(inp).squeeze(0)
+        P_peri = nn_out[0]
+        V_spt = nn_out[1]
 
-        Plvf = e * Elvf * (Vlvf - Vdlvf) + (1 - e) * P0lvf * (exp_lv - 1)
-        Prvf = e * Ervf * (Vrvf - Vdrvf) + (1 - e) * P0rvf * (exp_rv - 1)
-        Plv = Plvf + Pperi
-        Prv = Prvf + Pperi
-        Pao = Eao * (Vao - Vdao)
-        Pvc = Evc * (Vvc - Vdvc)
-        Ppa = Epa * (Vpa - Vdpa) + Pth
-        Ppu = Epu * (Vpu - Vdpu) + Pth
+        # Коррекция объёмов через перегородку
+        V_LV_free = V_LV - V_spt
+        V_RV_free = V_RV + V_spt
 
-        Qsys = (Pao - Pvc) / Rsys
-        Qpul = (Ppa - Ppu) / Rpul
+        # ===== Давления (закон Франка-Старлинга) =====
+        # Желудочки: P = E(t) * (V - V0) + Pperi
+        P_LV = E_LV * (V_LV_free - p['V0_lv']) + P_peri
+        P_RV = E_RV * (V_RV_free - p['V0_rv']) + P_peri
 
-        du = torch.zeros_like(u)
-        du[0] = (Ppu - Plv - Qmt * Rmt) / Lmt \
-            if (Ppu - Plv > 0 or Qmt > 0) else 0.0
-        du[1] = (Plv - Pao - Qav * Rav) / Lav \
-            if (Plv - Pao > 0 or Qav > 0) else 0.0
-        du[2] = (Pvc - Prv - Qtc * Rtc) / Ltc \
-            if (Pvc - Prv > 0 or Qtc > 0) else 0.0
-        du[3] = (Prv - Ppa - Qpv * Rpv) / Lpv \
-            if (Prv - Ppa > 0 or Qpv > 0) else 0.0
+        # Предсердия: P = E(t) * (V - V0)
+        P_LA = E_LA * (V_LA - p['V0_la'])
+        P_RA = E_RA * (V_RA - p['V0_ra'])
 
-        Qmt = torch.clamp(Qmt, min=0.0)
-        Qav = torch.clamp(Qav, min=0.0)
-        Qtc = torch.clamp(Qtc, min=0.0)
-        Qpv = torch.clamp(Qpv, min=0.0)
+        # Аорта: пассивная податливость P = V / C
+        P_Ao = (V_Ao - p['V0_ao']) / p['C_ao']
 
-        du[4] = Qmt - Qav
-        du[5] = Qav - Qsys
-        du[6] = Qsys - Qtc
-        du[7] = Qtc - Qpv
-        du[8] = Qpv - Qpul
-        du[9] = Qpul - Qmt
+        # Венозное давление (упрощённо — постоянное)
+        P_venous = p['P_venous']
 
-        return du
+        # Давление в лёгочной артерии (упрощённо)
+        P_pulm_artery = p['P_pulm_artery']
+
+        # ===== Потоки через клапаны (диоды) =====
+
+        # Митральный: LA → LV (открыт если P_LA > P_LV)
+        Q_mitral = torch.clamp(
+            (P_LA - P_LV) / p['R_mitral'], min=0.0)
+
+        # Аортальный: LV → Aorta (открыт если P_LV > P_Ao)
+        Q_aortic = torch.clamp(
+            (P_LV - P_Ao) / p['R_aortic'], min=0.0)
+
+        # Трикуспидальный: RA → RV (открыт если P_RA > P_RV)
+        Q_tricuspid = torch.clamp(
+            (P_RA - P_RV) / p['R_tricuspid'], min=0.0)
+
+        # Пульмональный: RV → Pulm.Art. (открыт если P_RV > P_pa)
+        Q_pulmonary = torch.clamp(
+            (P_RV - P_pulm_artery) / p['R_pulmonary'], min=0.0)
+
+        # Системный сток: Aorta → Veins
+        Q_systemic = (P_Ao - P_venous) / p['R_systemic']
+
+        # Возврат через вены
+        Q_vena_cava = (P_venous - P_RA) / p['R_venous']
+
+        # Лёгочный возврат в LA
+        Q_pulm_vein = (P_pulm_artery - P_LA) / p['R_pulm_vein']
+
+        # ===== Система 5 ОДУ (сохранение массы) =====
+        dV = torch.zeros(5)
+        dV[0] = Q_pulm_vein - Q_mitral        # dV_LA/dt
+        dV[1] = Q_mitral - Q_aortic            # dV_LV/dt
+        dV[2] = Q_aortic - Q_systemic          # dV_Ao/dt
+        dV[3] = Q_vena_cava - Q_tricuspid      # dV_RA/dt
+        dV[4] = Q_tricuspid - Q_pulmonary      # dV_RV/dt
+
+        return dV
 
 
-# =============================================
-# БЛОК 5: Сравнение модели с реальным ЭКГ
-# =============================================
+# =============================================================
+# БЛОК 6: Верификация через ЭКГ
+# =============================================================
 
-class ModelECGComparator:
+class ECGVerifier:
     """
-    Сравнивает выход ODE-модели с реальной ЭКГ.
-
-    Идея: давление в левом желудочке (Plv) коррелирует
-    с электрической активностью сердца, измеряемой на ЭКГ.
-    Мы извлекаем из модели «суррогат» ЭКГ и сравниваем
-    его форму с реальным эталонным кардиоциклом.
+    Верификация модели через электромеханическое сопряжение.
+    Проверяет соответствие dV/dt зубцам ЭКГ:
+      P-зубец → atrial kick (малый рост dV_LV/dt)
+      QRS → изоволюметрическое сокращение (dV_LV/dt ≈ 0)
+      ST → выброс (dV_LV/dt < 0)
+      T-зубец → изоволюметрическое расслабление (dV_LV/dt ≈ 0)
+      T-P → наполнение (dV_LV/dt > 0)
     """
 
-    @staticmethod
-    def extract_model_ecg_surrogate(sol_np, p_np, t_np):
+    def __init__(self, cardiac_activation):
+        self.activation = cardiac_activation
+
+    def extract_model_signals(self, sol_np, t_np, params):
         """
-        Извлекает суррогатный ЭКГ-сигнал из решения ODE.
-        Используем производную давления в ЛЖ (dPlv/dt)
-        как суррогат электрической активности.
+        Извлекает давления, потоки и производные из решения ODE.
         """
-        Vlv = sol_np[:, 4]
-        Vao = sol_np[:, 5]
+        V_LA = sol_np[:, 0]
+        V_LV = sol_np[:, 1]
+        V_Ao = sol_np[:, 2]
+        V_RA = sol_np[:, 3]
+        V_RV = sol_np[:, 4]
 
-        Elvf = p_np[0]
-        Eao = p_np[1]
-        Vdlvf = p_np[16]
-        Vdao = p_np[17]
+        # Эластансы
+        E_LV = np.array([
+            params['E_lv_min'] + (params['E_lv_max'] - params['E_lv_min'])
+            * self.activation.e_ventricle(t)
+            for t in t_np
+        ])
+        E_RV = np.array([
+            params['E_rv_min'] + (params['E_rv_max'] - params['E_rv_min'])
+            * self.activation.e_ventricle(t)
+            for t in t_np
+        ])
 
-        # Функция активации
-        e = np.exp(-80 * ((t_np % 0.75) - 0.375) ** 2)
+        # Давления
+        P_LV = E_LV * (V_LV - params['V0_lv'])
+        P_RV = E_RV * (V_RV - params['V0_rv'])
+        P_Ao = (V_Ao - params['V0_ao']) / params['C_ao']
 
-        # Упрощённое давление ЛЖ
-        Plv_approx = e * Elvf * (Vlv - Vdlvf)
+        # Производные объёмов
+        dV_LV = np.gradient(V_LV, t_np)
+        dV_RV = np.gradient(V_RV, t_np)
 
-        # Производная ~ ЭКГ-суррогат
-        ecg_surrogate = np.gradient(Plv_approx, t_np)
-
-        # Нормализация
-        ecg_min = ecg_surrogate.min()
-        ecg_max = ecg_surrogate.max()
-        if ecg_max - ecg_min > 1e-10:
-            ecg_surrogate = (ecg_surrogate - ecg_min) / (ecg_max - ecg_min)
-
-        return ecg_surrogate, Plv_approx
-
-    @staticmethod
-    def compute_similarity(model_signal, reference_signal):
-        """
-        Вычисляет метрики сходства:
-        - Корреляция Пирсона
-        - RMSE
-        - DTW-подобная метрика
-        """
-        # Привести к одной длине
-        if len(model_signal) != len(reference_signal):
-            reference_signal = resample(
-                reference_signal, len(model_signal)
-            )
-
-        # Нормализация обоих
-        def norm(s):
-            s = s - np.mean(s)
-            std = np.std(s)
-            return s / std if std > 1e-10 else s
-
-        ms = norm(model_signal)
-        rs = norm(reference_signal)
-
-        # Корреляция
-        correlation = np.corrcoef(ms, rs)[0, 1]
-
-        # RMSE
-        rmse = np.sqrt(np.mean((ms - rs) ** 2))
+        # Суррогатный ЭКГ: dP_LV/dt
+        dP_LV = np.gradient(P_LV, t_np)
 
         return {
-            'correlation': correlation,
-            'rmse': rmse
+            'V_LA': V_LA, 'V_LV': V_LV, 'V_Ao': V_Ao,
+            'V_RA': V_RA, 'V_RV': V_RV,
+            'P_LV': P_LV, 'P_RV': P_RV, 'P_Ao': P_Ao,
+            'E_LV': E_LV, 'E_RV': E_RV,
+            'dV_LV': dV_LV, 'dV_RV': dV_RV,
+            'dP_LV': dP_LV,
+            'ecg_surrogate': dP_LV / (np.max(np.abs(dP_LV)) + 1e-10)
         }
 
+    def verify_phases(self, model_signals, t_np, ecg_data):
+        """
+        Сводная верификация: проверяет поведение dV_LV/dt
+        в каждой фазе сердечного цикла по таблице.
+        """
+        T = self.activation.T
+        T_sys = self.activation.T_sys
 
-# =============================================
-# БЛОК 6: Визуализация
-# =============================================
+        results = []
+        for cycle_start in np.arange(0, t_np[-1] - T, T):
+            t_local = t_np - cycle_start
+            mask = (t_local >= 0) & (t_local < T)
+            t_c = t_local[mask]
+            dV = model_signals['dV_LV'][mask]
+            P = model_signals['P_LV'][mask]
 
-def plot_ecg_analysis(ecg_data, model_sol, model_t, p_np):
+            if len(t_c) < 10:
+                continue
+
+            # Фаза 1: P-зубец (предсердная систола)
+            # Ожидание: малый положительный dV_LV (atrial kick)
+            p_mask = (t_c > T - 0.20) & (t_c < T - 0.05)
+            atrial_kick = np.mean(dV[p_mask]) if np.any(p_mask) else 0
+
+            # Фаза 2: QRS (изоволюметрическое сокращение)
+            # Ожидание: dV_LV ≈ 0, P_LV резко растёт
+            qrs_mask = (t_c > 0.0) & (t_c < 0.05)
+            isovol_contraction = np.mean(np.abs(dV[qrs_mask])) \
+                if np.any(qrs_mask) else 0
+
+            # Фаза 3: ST-сегмент (выброс)
+            # Ожидание: dV_LV < 0 (объём падает)
+            st_mask = (t_c > 0.05) & (t_c < T_sys)
+            ejection = np.mean(dV[st_mask]) if np.any(st_mask) else 0
+
+            # Фаза 4: T-зубец (изоволюметрическое расслабление)
+            # Ожидание: dV_LV ≈ 0, P_LV падает
+            t_wave_mask = (t_c > T_sys) & (t_c < T_sys + 0.08)
+            isovol_relaxation = np.mean(np.abs(dV[t_wave_mask])) \
+                if np.any(t_wave_mask) else 0
+
+            # Фаза 5: Диастола (наполнение)
+            # Ожидание: dV_LV > 0 (объём растёт)
+            filling_mask = (t_c > T_sys + 0.08) & (t_c < T - 0.20)
+            filling = np.mean(dV[filling_mask]) if np.any(filling_mask) else 0
+
+            cycle_result = {
+                'atrial_kick': atrial_kick,
+                'atrial_kick_ok': atrial_kick > 0,
+                'isovol_contraction': isovol_contraction,
+                'isovol_contraction_ok': isovol_contraction < 50,
+                'ejection': ejection,
+                'ejection_ok': ejection < 0,
+                'isovol_relaxation': isovol_relaxation,
+                'isovol_relaxation_ok': isovol_relaxation < 50,
+                'filling': filling,
+                'filling_ok': filling > 0,
+            }
+            results.append(cycle_result)
+
+        return results
+
+    def compute_metrics(self, model_signal, real_signal):
+        """Корреляция Пирсона и RMSE."""
+        if len(model_signal) != len(real_signal):
+            real_signal = resample(real_signal, len(model_signal))
+
+        ms = (model_signal - np.mean(model_signal))
+        rs = (real_signal - np.mean(real_signal))
+        std_ms = np.std(ms)
+        std_rs = np.std(rs)
+        if std_ms > 1e-10:
+            ms = ms / std_ms
+        if std_rs > 1e-10:
+            rs = rs / std_rs
+
+        corr, p_val = pearsonr(ms, rs)
+        rmse = np.sqrt(np.mean((ms - rs) ** 2))
+
+        return {'correlation': corr, 'p_value': p_val, 'rmse': rmse}
+
+
+# =============================================================
+# БЛОК 7: Визуализация
+# =============================================================
+
+def plot_full_verification(ecg_data, model_signals, t_np,
+                           verification_results, metrics):
     """
-    Комплексная визуализация: реальное ЭКГ + модель
+    8 графиков: реальное ЭКГ + модель + верификация фаз.
     """
-    fig, axes = plt.subplots(3, 2, figsize=(16, 14))
+    fig, axes = plt.subplots(4, 2, figsize=(18, 20))
     fig.suptitle(
-        'Интеллектуальный анализатор кардиосигнала\n'
-        'Сравнение реального ЭКГ (PhysioNet ECG-ID) '
-        'с гибридной ODE-моделью',
-        fontsize=14, fontweight='bold'
-    )
+        'Верификация гибридной модели гемодинамики через ЭКГ\n'
+        'Электромеханическое сопряжение: ОДУ ↔ Reservoir Computing ↔ PhysioNet',
+        fontsize=14, fontweight='bold')
 
-    # --- 1. Сырой ЭКГ-сигнал ---
+    # 1. Реальное ЭКГ с R, P, T пиками
     ax = axes[0, 0]
     fs = ecg_data['fs']
-    t_ecg = np.arange(len(ecg_data['filtered'])) / fs
-    ax.plot(t_ecg, ecg_data['filtered'], 'b-', linewidth=0.5)
-    # R-пики
-    r_peaks = ecg_data['r_peaks']
-    ax.plot(
-        r_peaks / fs,
-        ecg_data['filtered'][r_peaks],
-        'rv', markersize=8, label='R-пики'
-    )
+    t_ecg = np.arange(len(ecg_data['normalized'])) / fs
+    ax.plot(t_ecg[:int(5*fs)], ecg_data['normalized'][:int(5*fs)],
+            'b-', linewidth=0.5)
+    r_mask = ecg_data['r_peaks'][ecg_data['r_peaks'] < int(5*fs)]
+    ax.plot(r_mask/fs, ecg_data['normalized'][r_mask],
+            'rv', markersize=8, label='R-пик')
+    if len(ecg_data['p_peaks']) > 0:
+        p_mask = ecg_data['p_peaks'][ecg_data['p_peaks'] < int(5*fs)]
+        ax.plot(p_mask/fs, ecg_data['normalized'][p_mask],
+                'g^', markersize=6, label='P-зубец')
+    if len(ecg_data['t_peaks']) > 0:
+        t_mask = ecg_data['t_peaks'][ecg_data['t_peaks'] < int(5*fs)]
+        ax.plot(t_mask/fs, ecg_data['normalized'][t_mask],
+                'ms', markersize=6, label='T-зубец')
+    ax.set_title(f'Реальное ЭКГ | ЧСС = {ecg_data["heart_rate"]:.0f} уд/мин')
     ax.set_xlabel('Время (с)')
-    ax.set_ylabel('Амплитуда (мВ)')
-    ax.set_title(
-        f'Реальное ЭКГ (отфильтрованное), '
-        f'ЧСС = {ecg_data["heart_rate"]:.0f} уд/мин'
-    )
     ax.legend()
     ax.grid(True, alpha=0.3)
 
-    # --- 2. Все кардиоциклы + средний ---
+    # 2. Средний кардиоцикл
     ax = axes[0, 1]
-    mean_cycle = ecg_data['mean_cycle']
-    std_cycle = ecg_data['std_cycle']
-    all_cycles = ecg_data['all_cycles_resampled']
-    t_cycle = np.linspace(0, 0.75, len(mean_cycle))
-
-    for i, cycle in enumerate(all_cycles):
-        ax.plot(t_cycle, cycle, 'b-', alpha=0.15, linewidth=0.5)
-    ax.plot(t_cycle, mean_cycle, 'r-', linewidth=2.5,
-            label='Средний цикл')
-    ax.fill_between(
-        t_cycle,
-        mean_cycle - std_cycle,
-        mean_cycle + std_cycle,
-        alpha=0.2, color='red', label='±1 σ'
-    )
-    ax.set_xlabel('Время в кардиоцикле (с)')
-    ax.set_ylabel('Нормализованная амплитуда')
-    ax.set_title(
-        f'Кардиоциклы ({len(all_cycles)} шт.) + '
-        f'референсный средний цикл'
-    )
+    mean_c = ecg_data['mean_cycle']
+    t_cycle = np.linspace(0, ecg_data['rr_interval'], len(mean_c))
+    for c in ecg_data['all_cycles_resampled']:
+        ax.plot(t_cycle, c, 'b-', alpha=0.1, linewidth=0.5)
+    ax.plot(t_cycle, mean_c, 'r-', linewidth=2.5, label='Средний цикл')
+    ax.fill_between(t_cycle,
+                    mean_c - ecg_data['std_cycle'],
+                    mean_c + ecg_data['std_cycle'],
+                    alpha=0.2, color='red', label='±1σ')
+    ax.set_title(f'Кардиоциклы ({len(ecg_data["cycles"])} шт.)')
+    ax.set_xlabel('Время в цикле (с)')
     ax.legend()
     ax.grid(True, alpha=0.3)
 
-    # --- 3. Переменные состояния модели ---
+    # 3. Объёмы 5 камер
     ax = axes[1, 0]
-    sol_np = model_sol.detach().cpu().numpy()
-    t_np = model_t.numpy()
-    labels = ['Qmt', 'Qav', 'Qtc', 'Qpv', 'Vlv',
-              'Vao', 'Vvc', 'Vrv', 'Vpa', 'Vpu']
-    for i in [4, 5, 7]:  # Объёмы: ЛЖ, аорта, ПЖ
-        ax.plot(t_np, sol_np[:, i], linewidth=1.5, label=labels[i])
+    labels_v = ['V_LA', 'V_LV', 'V_Ao', 'V_RA', 'V_RV']
+    colors_v = ['green', 'red', 'blue', 'orange', 'purple']
+    for i, (lbl, clr) in enumerate(zip(labels_v, colors_v)):
+        ax.plot(t_np, model_signals[lbl], color=clr, linewidth=1.5, label=lbl)
+    ax.set_title('Объёмы 5 камер сердца (из ОДУ)')
     ax.set_xlabel('Время (с)')
     ax.set_ylabel('Объём (мл)')
-    ax.set_title('Переменные модели: объёмы камер сердца')
     ax.legend()
     ax.grid(True, alpha=0.3)
 
-    # --- 4. Потоки модели ---
+    # 4. Давления
     ax = axes[1, 1]
-    for i in [0, 1, 2, 3]:  # Потоки
-        ax.plot(t_np, sol_np[:, i], linewidth=1.5, label=labels[i])
+    ax.plot(t_np, model_signals['P_LV'], 'r-', linewidth=1.5, label='P_LV')
+    ax.plot(t_np, model_signals['P_RV'], 'b-', linewidth=1.5, label='P_RV')
+    ax.plot(t_np, model_signals['P_Ao'], 'g-', linewidth=1.5, label='P_Ao')
+    ax.set_title('Давления (закон Франка-Старлинга)')
     ax.set_xlabel('Время (с)')
-    ax.set_ylabel('Поток (мл/с)')
-    ax.set_title('Переменные модели: потоки через клапаны')
+    ax.set_ylabel('Давление (мм рт.ст.)')
     ax.legend()
     ax.grid(True, alpha=0.3)
 
-    # --- 5. Суррогат ЭКГ из модели ---
+    # 5. dV_LV/dt с фазами ЭКГ
     ax = axes[2, 0]
-    comparator = ModelECGComparator()
-    ecg_surr, Plv = comparator.extract_model_ecg_surrogate(
-        sol_np, p_np, t_np
-    )
-
-    ax.plot(t_np, ecg_surr, 'g-', linewidth=1.5,
-            label='Суррогат ЭКГ (dPlv/dt)')
+    ax.plot(t_np, model_signals['dV_LV'], 'r-', linewidth=1.5)
+    ax.axhline(y=0, color='k', linestyle='--', alpha=0.5)
+    T = t_np[-1]
+    ax.axvspan(0, 0.05*T, alpha=0.1, color='yellow', label='QRS (изовол.)')
+    ax.axvspan(0.05*T, 0.35*T, alpha=0.1, color='red', label='Выброс')
+    ax.axvspan(0.35*T, 0.43*T, alpha=0.1, color='orange', label='T (изовол.)')
+    ax.axvspan(0.43*T, 0.85*T, alpha=0.1, color='green', label='Наполнение')
+    ax.axvspan(0.85*T, T, alpha=0.1, color='cyan', label='P (atrial kick)')
+    ax.set_title('dV_LV/dt — верификация фаз через ЭКГ')
     ax.set_xlabel('Время (с)')
-    ax.set_ylabel('Нормализованная амплитуда')
-    ax.set_title('ЭКГ-суррогат из ODE-модели')
-    ax.legend()
+    ax.set_ylabel('мл/с')
+    ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
 
-    # --- 6. Сравнение форм ---
+    # 6. Эластанс E(t) vs ЭКГ
     ax = axes[2, 1]
-    # Ресемплируем средний реальный цикл к длине суррогата модели
-    ref_resampled = resample(mean_cycle, len(ecg_surr))
-
-    # Нормализуем оба
-    def norm01(s):
-        return (s - s.min()) / (s.max() - s.min() + 1e-10)
-
-    ax.plot(t_np, norm01(ecg_surr), 'g-', linewidth=2,
-            label='Модель (суррогат)')
-    ax.plot(t_np, norm01(ref_resampled), 'r--', linewidth=2,
-            label='Реальное ЭКГ (средний цикл)')
-
-    metrics = comparator.compute_similarity(ecg_surr, mean_cycle)
+    ax.plot(t_np, model_signals['E_LV'], 'r-', linewidth=2, label='E_LV(t)')
+    ax.plot(t_np, model_signals['E_RV'], 'b-', linewidth=2, label='E_RV(t)')
+    ax2 = ax.twinx()
+    ecg_resampled = resample(ecg_data['mean_cycle'], len(t_np))
+    ax2.plot(t_np, ecg_resampled, 'g--', linewidth=1, alpha=0.7, label='ЭКГ')
+    ax.set_title('Эластанс E(t) синхронизирован с ЭКГ')
     ax.set_xlabel('Время (с)')
-    ax.set_ylabel('Нормализованная амплитуда')
+    ax.set_ylabel('Эластанс (мм рт.ст./мл)')
+    ax2.set_ylabel('ЭКГ (норм.)')
+    ax.legend(loc='upper left')
+    ax2.legend(loc='upper right')
+    ax.grid(True, alpha=0.3)
+
+    # 7. Суррогатный ЭКГ vs реальный
+    ax = axes[3, 0]
+    surr = model_signals['ecg_surrogate']
+    real_resamp = resample(ecg_data['mean_cycle'], len(surr))
+    real_norm = (real_resamp - real_resamp.min()) / (real_resamp.max() - real_resamp.min() + 1e-10)
+    surr_norm = (surr - surr.min()) / (surr.max() - surr.min() + 1e-10)
+    ax.plot(t_np, surr_norm, 'b-', linewidth=2, label='Модель (dP_LV/dt)')
+    ax.plot(t_np, real_norm, 'r--', linewidth=2, label='Реальный ЭКГ')
     ax.set_title(
-        f'Сравнение форм | '
-        f'Корреляция = {metrics["correlation"]:.3f}, '
-        f'RMSE = {metrics["rmse"]:.3f}'
-    )
+        f'Сравнение | r = {metrics["correlation"]:.3f}, '
+        f'RMSE = {metrics["rmse"]:.3f}')
+    ax.set_xlabel('Время (с)')
     ax.legend()
     ax.grid(True, alpha=0.3)
+
+    # 8. Таблица верификации
+    ax = axes[3, 1]
+    ax.axis('off')
+    if verification_results:
+        vr = verification_results[0]
+        table_data = [
+            ['Фаза ЭКГ', 'Ожидание dV_LV/dt', 'Значение', 'Статус'],
+            ['P-зубец', 'Рост (+)', f'{vr["atrial_kick"]:.1f}',
+             '✓' if vr['atrial_kick_ok'] else '✗'],
+            ['QRS', '≈ 0 (изовол.)', f'{vr["isovol_contraction"]:.1f}',
+             '✓' if vr['isovol_contraction_ok'] else '✗'],
+            ['ST (выброс)', 'Падение (-)', f'{vr["ejection"]:.1f}',
+             '✓' if vr['ejection_ok'] else '✗'],
+            ['T-зубец', '≈ 0 (изовол.)', f'{vr["isovol_relaxation"]:.1f}',
+             '✓' if vr['isovol_relaxation_ok'] else '✗'],
+            ['T-P (наполн.)', 'Рост (+)', f'{vr["filling"]:.1f}',
+             '✓' if vr['filling_ok'] else '✗'],
+        ]
+        table = ax.table(cellText=table_data, loc='center',
+                         cellLoc='center', colWidths=[0.25, 0.25, 0.2, 0.12])
+        table.auto_set_font_size(False)
+        table.set_fontsize(10)
+        table.scale(1.0, 1.8)
+        # Раскраска заголовка
+        for j in range(4):
+            table[0, j].set_facecolor('#4472C4')
+            table[0, j].set_text_props(color='white', fontweight='bold')
+        # Раскраска статуса
+        for i in range(1, 6):
+            color = '#C6EFCE' if table_data[i][3] == '✓' else '#FFC7CE'
+            table[i, 3].set_facecolor(color)
+    ax.set_title('Сводная таблица верификации', fontsize=12, pad=20)
 
     plt.tight_layout()
-    plt.savefig('cardiac_analysis_result.png', dpi=150,
+    plt.savefig('cardiac_verification_result.png', dpi=150,
                 bbox_inches='tight')
     plt.show()
 
-    return metrics
 
-
-# =============================================
-# БЛОК 7: Главная программа
-# =============================================
+# =============================================================
+# БЛОК 8: Главная программа
+# =============================================================
 
 def main():
-    print("=" * 60)
-    print("  ИНТЕЛЛЕКТУАЛЬНЫЙ АНАЛИЗАТОР КАРДИОСИГНАЛА")
-    print("  Гибридная ODE-модель + реальное ЭКГ (PhysioNet)")
-    print("=" * 60)
+    print("=" * 65)
+    print("  ГИБРИДНАЯ МОДЕЛЬ ГЕМОДИНАМИКИ + RESERVOIR COMPUTING")
+    print("  Верификация через реальное ЭКГ (PhysioNet)")
+    print("  5 ОДУ ↔ Электромеханическое сопряжение ↔ ЭКГ")
+    print("=" * 65)
 
-    # ----- Шаг 1: Загрузка реального ЭКГ -----
-    print("\n[1/5] Загрузка ЭКГ с PhysioNet ECG-ID Database...")
-
+    # ===== 1. Загрузка ЭКГ =====
+    print("\n[1/6] Загрузка ЭКГ с PhysioNet...")
     loader = PhysioNetECGLoader()
-
     try:
-        person_id = int(input(
-            "Номер пациента (1-90, Enter=1): "
-        ) or "1")
-        record_id = int(input(
-            "Номер записи (1-20, Enter=1): "
-        ) or "1")
+        person_id = int(input("Номер пациента (1-90, Enter=1): ") or "1")
+        record_id = int(input("Номер записи (1-20, Enter=1): ") or "1")
     except ValueError:
         person_id, record_id = 1, 1
 
-    edf_path = loader.download_sample_record(person_id, record_id)
-
-    if os.path.exists(edf_path):
-        ecg_raw, fs, ch_labels = loader.read_edf_file(edf_path)
-        print(f"\nСигнал загружен: {len(ecg_raw)} отсчётов, "
-              f"{fs} Гц, {len(ecg_raw) / fs:.1f} сек")
+    edf_path = loader.download_record(person_id, record_id)
+    if edf_path and os.path.exists(edf_path):
+        ecg_raw, fs = loader.read_edf(edf_path)
     else:
-        print("\nФайл не найден. Генерирую синтетическое ЭКГ...")
+        print("Файл не найден. Генерирую синтетическое ЭКГ...")
         fs = 500
         ecg_raw = _generate_synthetic_ecg(fs, duration=10)
 
-    # ----- Шаг 2: Обработка ЭКГ -----
-    print("\n[2/5] Предобработка ЭКГ-сигнала...")
+    # ===== 2. Предобработка =====
+    print("\n[2/6] Предобработка ЭКГ...")
     preprocessor = ECGPreprocessor()
-    ecg_data = preprocessor.full_pipeline(ecg_raw, fs, target_length=200)
-
+    ecg_data = preprocessor.full_pipeline(ecg_raw, fs, target_length=500)
     if ecg_data is None:
-        print("Ошибка обработки ЭКГ. Выход.")
+        print("Ошибка обработки. Выход.")
         return
 
-    # ----- Шаг 3: Параметры ODE-модели -----
-    print("\n[3/5] Инициализация гибридной ODE-модели...")
+    # ===== 3. Параметры модели из ЭКГ =====
+    print("\n[3/6] Настройка модели по данным ЭКГ...")
+    rr = ecg_data['rr_interval']
+    T_sys = 0.3 * rr / 0.85  # масштабирование систолы
 
-    p_np = np.array([
-        2.8798, 0.6913, 0.0059, 0.585, 0.369, 0.0073,
-        0.0158, 0.018, 1.0889, 0.0237, 0.0055, 0.1552,
-        7.6968e-5, 1.2189e-4, 8.0093e-5, 1.4868e-4,
-        0, 0, 0, 0, 0, 0,
-        0.1203, 0.2157, 0.033, 0.023,
-        48.754, 0, 0, 1.1101, 0.5003,
-        2, 200, 0.435, 0.03, 2, -4
-    ], dtype=np.float32)
-    p_tensor = torch.from_numpy(p_np)
+    params = {
+        # Эластансы желудочков
+        'E_lv_min': torch.tensor(0.08),
+        'E_lv_max': torch.tensor(2.5),
+        'E_rv_min': torch.tensor(0.05),
+        'E_rv_max': torch.tensor(1.15),
+        # Эластансы предсердий
+        'E_la_min': torch.tensor(0.15),
+        'E_la_max': torch.tensor(0.25),
+        'E_ra_min': torch.tensor(0.10),
+        'E_ra_max': torch.tensor(0.15),
+        # Податливость аорты
+        'C_ao': torch.tensor(1.5),
+        # Ненагруженные объёмы
+        'V0_lv': torch.tensor(5.0),
+        'V0_rv': torch.tensor(10.0),
+        'V0_la': torch.tensor(4.0),
+        'V0_ra': torch.tensor(4.0),
+        'V0_ao': torch.tensor(250.0),
+        # Сопротивления клапанов
+        'R_mitral': torch.tensor(0.01),
+        'R_aortic': torch.tensor(0.01),
+        'R_tricuspid': torch.tensor(0.01),
+        'R_pulmonary': torch.tensor(0.01),
+        # Сосудистые сопротивления
+        'R_systemic': torch.tensor(1.0),
+        'R_venous': torch.tensor(0.05),
+        'R_pulm_vein': torch.tensor(0.08),
+        # Постоянные давления
+        'P_venous': torch.tensor(5.0),
+        'P_pulm_artery': torch.tensor(15.0),
+    }
 
-    # Начальные условия
-    print("\nВведите начальные условия (10 значений через пробел):")
-    print("  [Qmt, Qav, Qtc, Qpv, Vlv, Vao, Vvc, Vrv, Vpa, Vpu]")
-    print("  (Enter — значения по умолчанию)")
+    cardiac_act = CardiacActivation(
+        T=rr,
+        T_sys=T_sys,
+        T_atrial=0.1,
+        atrial_delay=0.12
+    )
 
-    try:
-        line = input("> ").strip()
-        if line:
-            u0_vals = list(map(float, line.split()))
-            assert len(u0_vals) == 10
-        else:
-            raise ValueError
-    except:
-        u0_vals = [
-            245.5813, 0.0, 190.0661, 0.0, 94.6812,
-            133.3381, 329.7803, 90.7302, 43.0123, 808.4579
-        ]
-        print("Используются значения по умолчанию.")
+    print(f"  Период RR: {rr*1000:.0f} мс")
+    print(f"  Систола: {T_sys*1000:.0f} мс")
+    print(f"  ЧСС: {ecg_data['heart_rate']:.0f} уд/мин")
 
-    u0 = torch.tensor(u0_vals, dtype=torch.float32)
+    # ===== 4. Решение ОДУ =====
+    print(f"\n[4/6] Решение системы 5 ОДУ...")
 
-    # Длительность ~ один кардиоцикл из реальной ЧСС
-    rr_sec = 60.0 / ecg_data['heart_rate']
-    print(f"\nДлительность кардиоцикла по ЭКГ: {rr_sec * 1000:.0f} мс")
+    net = ReservoirNet(input_dim=5, reservoir_size=100, output_dim=2)
+    ode_func = HybridCardiacODE(params, net, cardiac_act)
 
-    try:
-        dur_input = input(
-            f"Длительность моделирования (Enter={rr_sec:.2f} с): "
-        ).strip()
-        duration = float(dur_input) if dur_input else rr_sec
-    except:
-        duration = rr_sec
-
-    t = torch.linspace(0.0, duration, 200, dtype=torch.float32)
-
-    # ----- Шаг 4: Решение ODE -----
-    print(f"\n[4/5] Решение ODE (t = 0..{duration:.3f} с)...")
-
-    net = ReservoirNet()
-    func = HybridODEFunc(p_tensor, net)
+    # Начальные условия: [V_LA, V_LV, V_Ao, V_RA, V_RV]
+    V0 = torch.tensor([30.0, 120.0, 280.0, 25.0, 110.0])
+    t_span = torch.linspace(0.0, rr, 500, dtype=torch.float32)
 
     with torch.no_grad():
-        sol = odeint(func, u0, t, method='bosh3')
+        sol = odeint(ode_func, V0, t_span, method='bosh3')
 
-    print("Решение получено!")
+    sol_np = sol.detach().cpu().numpy()
+    t_np = t_span.numpy()
+    print("  Решение получено!")
 
-    # ----- Шаг 5: Визуализация и сравнение -----
-    print("\n[5/5] Визуализация и сравнение с реальным ЭКГ...")
+    # ===== 5. Верификация =====
+    print("\n[5/6] Верификация через ЭКГ...")
 
-    metrics = plot_ecg_analysis(ecg_data, sol, t, p_np)
+    params_np = {k: v.item() for k, v in params.items()}
+    verifier = ECGVerifier(cardiac_act)
+    model_signals = verifier.extract_model_signals(sol_np, t_np, params_np)
+    verification = verifier.verify_phases(model_signals, t_np, ecg_data)
+    metrics = verifier.compute_metrics(
+        model_signals['ecg_surrogate'], ecg_data['mean_cycle'])
+
+    # ===== 6. Визуализация =====
+    print("\n[6/6] Визуализация...")
+    plot_full_verification(ecg_data, model_signals, t_np,
+                           verification, metrics)
 
     # Итоговый отчёт
-    print("\n" + "=" * 60)
-    print("  РЕЗУЛЬТАТЫ АНАЛИЗА")
-    print("=" * 60)
+    print("\n" + "=" * 65)
+    print("  РЕЗУЛЬТАТЫ ВЕРИФИКАЦИИ")
+    print("=" * 65)
     print(f"  Пациент: Person_{person_id:02d}, запись rec_{record_id}")
-    print(f"  ЧСС (реальная):          {ecg_data['heart_rate']:.1f} уд/мин")
-    print(f"  Кардиоциклов найдено:     {len(ecg_data['cycles'])}")
-    print(f"  Корреляция модель/ЭКГ:    {metrics['correlation']:.4f}")
-    print(f"  RMSE модель/ЭКГ:          {metrics['rmse']:.4f}")
-    print(f"  График сохранён: cardiac_analysis_result.png")
-    print("=" * 60)
+    print(f"  ЧСС: {ecg_data['heart_rate']:.1f} уд/мин")
+    print(f"  Корреляция модель/ЭКГ: {metrics['correlation']:.4f}")
+    print(f"  RMSE модель/ЭКГ: {metrics['rmse']:.4f}")
+
+    if verification:
+        vr = verification[0]
+        print(f"\n  Фазовая верификация:")
+        phases = [
+            ('P-зубец (atrial kick)', vr['atrial_kick_ok']),
+            ('QRS (изоволюметр. сокращ.)', vr['isovol_contraction_ok']),
+            ('ST (выброс)', vr['ejection_ok']),
+            ('T (изоволюметр. расслабл.)', vr['isovol_relaxation_ok']),
+            ('T-P (наполнение)', vr['filling_ok']),
+        ]
+        for name, ok in phases:
+            status = '✓' if ok else '✗'
+            print(f"    {status} {name}")
+
+    print(f"\n  График: cardiac_verification_result.png")
+    print("=" * 65)
 
 
 def _generate_synthetic_ecg(fs=500, duration=10):
-    """
-    Генерация синтетического ЭКГ
-    (если PhysioNet недоступен)
-    """
+    """Синтетическое ЭКГ если PhysioNet недоступен."""
     t = np.arange(0, duration, 1.0 / fs)
-    heart_rate = 72
-    period = 60.0 / heart_rate
-
+    period = 60.0 / 72
     ecg = np.zeros_like(t)
     for i, ti in enumerate(t):
         phase = (ti % period) / period
-        # P-зубец
-        ecg[i] += 0.15 * np.exp(-((phase - 0.1) ** 2) / 0.001)
-        # QRS-комплекс
-        ecg[i] -= 0.1 * np.exp(-((phase - 0.22) ** 2) / 0.0002)
-        ecg[i] += 1.0 * np.exp(-((phase - 0.25) ** 2) / 0.0003)
-        ecg[i] -= 0.2 * np.exp(-((phase - 0.28) ** 2) / 0.0002)
-        # T-зубец
-        ecg[i] += 0.3 * np.exp(-((phase - 0.45) ** 2) / 0.003)
-
-    # Добавляем немного шума
+        ecg[i] += 0.15 * np.exp(-((phase - 0.10)**2) / 0.001)  # P
+        ecg[i] -= 0.10 * np.exp(-((phase - 0.22)**2) / 0.0002)  # Q
+        ecg[i] += 1.00 * np.exp(-((phase - 0.25)**2) / 0.0003)  # R
+        ecg[i] -= 0.20 * np.exp(-((phase - 0.28)**2) / 0.0002)  # S
+        ecg[i] += 0.30 * np.exp(-((phase - 0.45)**2) / 0.003)   # T
     ecg += np.random.normal(0, 0.02, len(ecg))
-
     return ecg
 
 
